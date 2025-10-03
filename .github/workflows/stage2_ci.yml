@@ -1,0 +1,130 @@
+name: Stage 2 — Staging Provision, Deploy, Test, Destroy
+
+on:
+  workflow_run:
+    workflows: ["Stage 1 CI — Test, Build & Push to ACR"]
+    types: [completed]
+  workflow_dispatch:
+
+env:
+  LOCATION: eastasia
+  ACR_LOGIN_SERVER: ${{ secrets.AZURE_CONTAINER_REGISTRY }}
+  IMAGE_TAG: latest
+
+jobs:
+  staging:
+    name: Provision, Deploy to Staging, Test, Destroy
+    runs-on: ubuntu-latest
+    if: >
+      ${{
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'testing'
+      }} || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (SPN)
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set run-scoped names
+        id: names
+        shell: bash
+        run: |
+          RG="week10-staging-vedh-${{ github.run_id }}"
+          PLAN="week10-staging-plan-vedh-${{ github.run_id }}"
+          PROD_APP="week10-staging-product-vedh-${{ github.run_id }}"
+          ORDER_APP="week10-staging-order-vedh-${{ github.run_id }}"
+          CUST_APP="week10-staging-customer-vedh-${{ github.run_id }}"
+          echo "rg=$RG" >> $GITHUB_OUTPUT
+          echo "plan=$PLAN" >> $GITHUB_OUTPUT
+          echo "prod_app=$PROD_APP" >> $GITHUB_OUTPUT
+          echo "order_app=$ORDER_APP" >> $GITHUB_OUTPUT
+          echo "cust_app=$CUST_APP" >> $GITHUB_OUTPUT
+
+      - name: Create Resource Group
+        run: |
+          az group create -n "${{ steps.names.outputs.rg }}" -l "${{ env.LOCATION }}"
+
+      - name: Create App Service Plan (Linux, B1)
+        run: |
+          az appservice plan create \
+            --name "${{ steps.names.outputs.plan }}" \
+            --resource-group "${{ steps.names.outputs.rg }}" \
+            --location "${{ env.LOCATION }}" \
+            --is-linux \
+            --sku B1
+
+      - name: Derive ACR name and login (optional)
+        id: acr
+        shell: bash
+        run: |
+          ACR_NAME="${ACR_LOGIN_SERVER%%.*}"
+          echo "acr_name=$ACR_NAME" >> $GITHUB_OUTPUT
+          az acr login --name "$ACR_NAME" || true
+
+      - name: Create Product Staging WebApp
+        run: |
+          az webapp create \
+            --resource-group "${{ steps.names.outputs.rg }}" \
+            --plan "${{ steps.names.outputs.plan }}" \
+            --name "${{ steps.names.outputs.prod_app }}" \
+            --deployment-container-image-name "${{ env.ACR_LOGIN_SERVER }}/product_service:${{ env.IMAGE_TAG }}"
+
+      - name: Create Order Staging WebApp
+        run: |
+          az webapp create \
+            --resource-group "${{ steps.names.outputs.rg }}" \
+            --plan "${{ steps.names.outputs.plan }}" \
+            --name "${{ steps.names.outputs.order_app }}" \
+            --deployment-container-image-name "${{ env.ACR_LOGIN_SERVER }}/order_service:${{ env.IMAGE_TAG }}"
+
+      - name: Create Customer Staging WebApp
+        run: |
+          az webapp create \
+            --resource-group "${{ steps.names.outputs.rg }}" \
+            --plan "${{ steps.names.outputs.plan }}" \
+            --name "${{ steps.names.outputs.cust_app }}" \
+            --deployment-container-image-name "${{ env.ACR_LOGIN_SERVER }}/customer_service:${{ env.IMAGE_TAG }}"
+
+      - name: Configure ACR credentials on WebApps (optional)
+        env:
+          ACR_USER: ${{ secrets.ACR_USERNAME }}
+          ACR_PASS: ${{ secrets.ACR_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -n "$ACR_USER" ] && [ -n "$ACR_PASS" ]; then
+            echo "Configuring ACR credentials on staging apps..."
+            for APP in "${{ steps.names.outputs.prod_app }}" "${{ steps.names.outputs.order_app }}" "${{ steps.names.outputs.cust_app }}"; do
+              case "$APP" in
+                *product*) REPO="product_service" ;;
+                *order*)   REPO="order_service" ;;
+                *customer*)REPO="customer_service" ;;
+              esac
+              az webapp config container set \
+                --resource-group "${{ steps.names.outputs.rg }}" \
+                --name "$APP" \
+                --docker-custom-image-name "${{ env.ACR_LOGIN_SERVER }}/${REPO}:${{ env.IMAGE_TAG }}" \
+                --docker-registry-server-url "https://${{ env.ACR_LOGIN_SERVER }}" \
+                --docker-registry-server-user "$ACR_USER" \
+                --docker-registry-server-password "$ACR_PASS"
+            done
+          else
+            echo "ACR_USERNAME/ACR_PASSWORD not set. Skipping container credential config (use Managed Identity + AcrPull instead)."
+          fi
+
+      - name: Restart apps and warm up
+        run: |
+          for APP in "${{ steps.names.outputs.prod_app }}" "${{ steps.names.outputs.order_app }}" "${{ steps.names.outputs.cust_app }}"; do
+            az webapp restart -g "${{ steps.names.outputs.rg }}" -n "$APP"
+          done
+          sleep 25
+
+      - name: Destroy staging RG (always)
+        if: always()
+        run: |
+          az group delete -n "${{ steps.names.outputs.rg }}" --yes --no-wait
